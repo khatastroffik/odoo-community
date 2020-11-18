@@ -141,8 +141,7 @@ class PosSession(models.Model):
 
     def action_stock_picking(self):
         self.ensure_one()
-        action_picking = self.env.ref('stock.action_picking_tree_ready')
-        action = action_picking.read()[0]
+        action = self.env['ir.actions.act_window']._for_xml_id('stock.action_picking_tree_ready')
         action['context'] = {}
         action['domain'] = [('id', 'in', self.picking_ids.ids)]
         return action
@@ -260,6 +259,8 @@ class PosSession(models.Model):
     def action_pos_session_closing_control(self):
         self._check_pos_session_balance()
         for session in self:
+            if session.state == 'closed':
+                raise UserError(_('This session is already closed.'))
             session.write({'state': 'closing_control', 'stop_at': fields.Datetime.now()})
             if not session.config_id.cash_control:
                 session.action_pos_session_close()
@@ -298,6 +299,8 @@ class PosSession(models.Model):
         self.cash_real_transaction = self.cash_register_total_entry_encoding
         self.cash_real_expected = self.cash_register_balance_end
         self.cash_real_difference = self.cash_register_difference
+        if self.state == 'closed':
+            raise UserError(_('This session is already closed.'))
         self._check_if_no_draft_orders()
         if self.update_stock_at_closing:
             self._create_picking_at_end_of_session()
@@ -481,7 +484,8 @@ class PosSession(models.Model):
                     rounding_difference = self._update_amounts(rounding_difference, {'amount': diff}, order.date_order)
 
                 # Increasing current partner's customer_rank
-                order.partner_id._increase_rank('customer_rank')
+                partners = (order.partner_id | order.partner_id.commercial_partner_id)
+                partners._increase_rank('customer_rank')
 
         if self.company_id.anglo_saxon_accounting:
             global_session_pickings = self.picking_ids.filtered(lambda p: not p.pos_order_id)
