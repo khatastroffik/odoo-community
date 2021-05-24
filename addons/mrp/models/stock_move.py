@@ -3,7 +3,7 @@
 
 from odoo import api, exceptions, fields, models, _
 from odoo.exceptions import UserError
-from odoo.tools import float_compare, float_round, float_is_zero
+from odoo.tools import float_compare, float_round, float_is_zero, OrderedSet
 
 
 class StockMoveLine(models.Model):
@@ -95,7 +95,7 @@ class StockMove(models.Model):
         'mrp.routing.workcenter', 'Operation To Consume', check_company=True,
         domain="[('id', 'in', allowed_operation_ids)]")
     workorder_id = fields.Many2one(
-        'mrp.workorder', 'Work Order To Consume', check_company=True)
+        'mrp.workorder', 'Work Order To Consume', copy=False, check_company=True)
     # Quantities to process, in normalized UoMs
     bom_line_id = fields.Many2one('mrp.bom.line', 'BoM Line', check_company=True)
     byproduct_id = fields.Many2one(
@@ -204,6 +204,21 @@ class StockMove(models.Model):
                 defaults['additional'] = True
         return defaults
 
+    def write(self, vals):
+        if 'product_uom_qty' in vals and 'move_line_ids' in vals:
+            # first update lines then product_uom_qty as the later will unreserve
+            # so possibly unlink lines
+            move_line_vals = vals.pop('move_line_ids')
+            super().write({'move_line_ids': move_line_vals})
+        return super().write(vals)
+
+    def unlink(self):
+        # Avoid deleting move related to active MO
+        for move in self:
+            if move.production_id and move.production_id.state not in ('draft', 'cancel'):
+                raise UserError(_('Please cancel the Manufacture Order first.'))
+        return super(StockMove, self).unlink()
+
     def _action_assign(self):
         res = super(StockMove, self)._action_assign()
         for move in self.filtered(lambda x: x.production_id or x.raw_material_production_id):
@@ -222,16 +237,16 @@ class StockMove(models.Model):
         # in order to explode a move, we must have a picking_type_id on that move because otherwise the move
         # won't be assigned to a picking and it would be weird to explode a move into several if they aren't
         # all grouped in the same picking.
-        moves_to_return = self.env['stock.move']
-        moves_to_unlink = self.env['stock.move']
+        moves_ids_to_return = OrderedSet()
+        moves_ids_to_unlink = OrderedSet()
         phantom_moves_vals_list = []
         for move in self:
             if not move.picking_type_id or (move.production_id and move.production_id.product_id == move.product_id):
-                moves_to_return |= move
+                moves_ids_to_return.add(move.id)
                 continue
             bom = self.env['mrp.bom'].sudo()._bom_find(product=move.product_id, company_id=move.company_id.id, bom_type='phantom')
             if not bom:
-                moves_to_return |= move
+                moves_ids_to_return.add(move.id)
                 continue
             if move.picking_id.immediate_transfer:
                 factor = move.product_uom._compute_quantity(move.quantity_done, bom.product_uom_id) / bom.product_qty
@@ -244,14 +259,14 @@ class StockMove(models.Model):
                 else:
                     phantom_moves_vals_list += move._generate_move_phantom(bom_line, line_data['qty'], 0)
             # delete the move with original product which is not relevant anymore
-            moves_to_unlink |= move
+            moves_ids_to_unlink.add(move.id)
 
-        moves_to_unlink.sudo().unlink()
+        self.env['stock.move'].browse(moves_ids_to_unlink).sudo().unlink()
         if phantom_moves_vals_list:
             phantom_moves = self.env['stock.move'].create(phantom_moves_vals_list)
             phantom_moves._adjust_procure_method()
-            moves_to_return |= phantom_moves.action_explode()
-        return moves_to_return
+            moves_ids_to_return |= phantom_moves.action_explode().ids
+        return self.env['stock.move'].browse(moves_ids_to_return)
 
     def action_show_details(self):
         self.ensure_one()

@@ -16,6 +16,7 @@ from odoo import api, fields, models, tools
 from odoo.addons.http_routing.models.ir_http import slugify, _guess_mimetype, url_for
 from odoo.addons.website.models.ir_http import sitemap_qs2dom
 from odoo.addons.portal.controllers.portal import pager
+from odoo.exceptions import UserError
 from odoo.http import request
 from odoo.modules.module import get_resource_path
 from odoo.osv.expression import FALSE_DOMAIN
@@ -159,6 +160,17 @@ class Website(models.Model):
     def _get_menu_ids(self):
         return self.env['website.menu'].search([('website_id', '=', self.id)]).ids
 
+    def _bootstrap_snippet_filters(self):
+        ir_filter = self.env.ref('website.dynamic_snippet_country_filter', raise_if_not_found=False)
+        if ir_filter:
+            self.env['website.snippet.filter'].create({
+                'field_names': 'name,code,image_url:image,phone_code:char',
+                'filter_id': ir_filter.id,
+                'limit': 16,
+                'name': _('Countries'),
+                'website_id': self.id,
+            })
+
     @api.model
     def create(self, vals):
         self._handle_favicon(vals)
@@ -169,6 +181,7 @@ class Website(models.Model):
 
         res = super(Website, self).create(vals)
         res._bootstrap_homepage()
+        res._bootstrap_snippet_filters()
 
         if not self.env.user.has_group('website.group_multi_website') and self.search_count([]) > 1:
             all_user_groups = 'base.group_portal,base.group_user,base.group_public'
@@ -195,7 +208,13 @@ class Website(models.Model):
             self.env['ir.qweb'].clear_caches()
 
         if 'cookies_bar' in values:
-            if values['cookies_bar']:
+            existing_policy_page = self.env['website.page'].search([
+                ('website_id', '=', self.id),
+                ('url', '=', '/cookie-policy'),
+            ])
+            if not values['cookies_bar']:
+                existing_policy_page.unlink()
+            elif not existing_policy_page:
                 cookies_view = self.env.ref('website.cookie_policy', raise_if_not_found=False)
                 if cookies_view:
                     cookies_view.with_context(website_id=self.id).write({'website_id': self.id})
@@ -207,11 +226,6 @@ class Website(models.Model):
                         'website_id': self.id,
                         'view_id': specific_cook_view.id,
                     })
-            else:
-                self.env['website.page'].search([
-                    ('website_id', '=', self.id),
-                    ('url', '=', '/cookie-policy'),
-                ]).unlink()
 
         return result
 
@@ -221,6 +235,9 @@ class Website(models.Model):
             vals['favicon'] = tools.image_process(vals['favicon'], size=(256, 256), crop='center', output_format='ICO')
 
     def unlink(self):
+        website = self.search([('id', 'not in', self.ids)], limit=1)
+        if not website:
+            raise UserError(_('You must keep at least one website.'))
         # Do not delete invoices, delete what's strictly necessary
         attachments_to_unlink = self.env['ir.attachment'].search([
             ('website_id', 'in', self.ids),
@@ -954,7 +971,7 @@ class Website(models.Model):
             for key, val in list(arguments.items()):
                 if isinstance(val, models.BaseModel):
                     if val.env.context.get('lang') != lang.code:
-                        arguments[key] = val.with_context(lang=lang.url_code)
+                        arguments[key] = val.with_context(lang=lang.code)
             path = router.build(request.endpoint, arguments)
         else:
             # The build method returns a quoted URL so convert in this case for consistency.

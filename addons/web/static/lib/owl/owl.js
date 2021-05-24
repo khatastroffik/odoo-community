@@ -181,15 +181,15 @@
     // Misc types, constants and helpers
     //------------------------------------------------------------------------------
     const RESERVED_WORDS = "true,false,NaN,null,undefined,debugger,console,window,in,instanceof,new,function,return,this,eval,void,Math,RegExp,Array,Object,Date".split(",");
-    const WORD_REPLACEMENT = {
+    const WORD_REPLACEMENT = Object.assign(Object.create(null), {
         and: "&&",
         or: "||",
         gt: ">",
         gte: ">=",
         lt: "<",
         lte: "<=",
-    };
-    const STATIC_TOKEN_MAP = {
+    });
+    const STATIC_TOKEN_MAP = Object.assign(Object.create(null), {
         "{": "LEFT_BRACE",
         "}": "RIGHT_BRACE",
         "[": "LEFT_BRACKET",
@@ -198,7 +198,7 @@
         ",": "COMMA",
         "(": "LEFT_PAREN",
         ")": "RIGHT_PAREN",
-    };
+    });
     // note that the space after typeof is relevant. It makes sure that the formatted
     // expression has a space after typeof
     const OPERATORS = "...,.,===,==,+,!==,!=,!,||,&&,>=,>,<=,<,?,-,*,/,%,typeof ,=>,=,;,in ".split(",");
@@ -1240,6 +1240,7 @@
 
     const patch = init([eventListenersModule, attrsModule, propsModule, classModule]);
 
+    let localStorage = null;
     const browser = {
         setTimeout: window.setTimeout.bind(window),
         clearTimeout: window.clearTimeout.bind(window),
@@ -1249,7 +1250,12 @@
         random: Math.random,
         Date: window.Date,
         fetch: (window.fetch || (() => { })).bind(window),
-        localStorage: window.localStorage,
+        get localStorage() {
+            return localStorage || window.localStorage;
+        },
+        set localStorage(newLocalStorage) {
+            localStorage = newLocalStorage;
+        },
     };
 
     /**
@@ -1364,6 +1370,7 @@
     const TRANSLATABLE_ATTRS = ["label", "title", "placeholder", "alt"];
     const lineBreakRE = /[\r\n]/;
     const whitespaceRE = /\s+/g;
+    const translationRE = /^(\s*)([\s\S]+?)(\s*)$/;
     const NODE_HOOKS_PARAMS = {
         create: "(_, n)",
         insert: "vn",
@@ -1718,7 +1725,8 @@
                 }
                 if (this.translateFn) {
                     if (node.parentNode.getAttribute("t-translation") !== "off") {
-                        text = this.translateFn(text);
+                        const match = translationRE.exec(text);
+                        text = match[1] + this.translateFn(match[2]) + match[3];
                     }
                 }
                 if (ctx.parentNode) {
@@ -2523,7 +2531,7 @@
             code = ctx.captureExpression(value);
         }
         const modCode = mods.map((mod) => modcodes[mod]).join("");
-        let handler = `function (e) {if (!context.__owl__.isMounted){return}${modCode}${code}}`;
+        let handler = `function (e) {if (context.__owl__.status === ${5 /* DESTROYED */}){return}${modCode}${code}}`;
         if (putInCache) {
             const key = ctx.generateTemplateKey(event);
             ctx.addLine(`extra.handlers[${key}] = extra.handlers[${key}] || ${handler};`);
@@ -2660,7 +2668,8 @@
         priority: 80,
         atNodeEncounter({ ctx, value, node, qweb }) {
             const slotKey = ctx.generateID();
-            ctx.addLine(`const slot${slotKey} = this.constructor.slots[context.__owl__.slotId + '_' + '${value}'];`);
+            const valueExpr = value.match(INTERP_REGEXP) ? ctx.interpolate(value) : `'${value}'`;
+            ctx.addLine(`const slot${slotKey} = this.constructor.slots[context.__owl__.slotId + '_' + ${valueExpr}];`);
             ctx.addIf(`slot${slotKey}`);
             let parentNode = `c${ctx.parentNode}`;
             if (!ctx.parentNode) {
@@ -3167,7 +3176,7 @@
             // need to update component
             let styleCode = "";
             if (tattStyle) {
-                styleCode = `.then(()=>{if (w${componentID}.__owl__.isDestroyed) {return};w${componentID}.el.style=${tattStyle};});`;
+                styleCode = `.then(()=>{if (w${componentID}.__owl__.status === ${5 /* DESTROYED */}) {return};w${componentID}.el.style=${tattStyle};});`;
             }
             ctx.addLine(`w${componentID}.__updateProps(props${componentID}, extra.fiber, ${scope})${styleCode};`);
             ctx.addLine(`let pvnode = w${componentID}.__owl__.pvnode;`);
@@ -3179,13 +3188,10 @@
             }
             ctx.addElse();
             // new component
-            let dynamicFallback = "";
-            if (!value.match(INTERP_REGEXP)) {
-                dynamicFallback = `|| ${ctx.formatExpression(value)}`;
-            }
+            const contextualValue = value.match(INTERP_REGEXP) ? "false" : ctx.formatExpression(value);
             const interpValue = ctx.interpolate(value);
             ctx.addLine(`let componentKey${componentID} = ${interpValue};`);
-            ctx.addLine(`let W${componentID} = context.constructor.components[componentKey${componentID}] || QWeb.components[componentKey${componentID}]${dynamicFallback};`);
+            ctx.addLine(`let W${componentID} = ${contextualValue} || context.constructor.components[componentKey${componentID}] || QWeb.components[componentKey${componentID}];`);
             // maybe only do this in dev mode...
             ctx.addLine(`if (!W${componentID}) {throw new Error('Cannot find the definition of component "' + componentKey${componentID} + '"')}`);
             ctx.addLine(`w${componentID} = new W${componentID}(parent, props${componentID});`);
@@ -3408,6 +3414,7 @@
             this.parent = parent;
             let oldFiber = __owl__.currentFiber;
             if (oldFiber && !oldFiber.isCompleted) {
+                this.force = true;
                 if (oldFiber.root === oldFiber && !parent) {
                     // both oldFiber and this fiber are root fibers
                     this._reuseFiber(oldFiber);
@@ -3430,6 +3437,8 @@
          */
         _reuseFiber(oldFiber) {
             oldFiber.cancel(); // cancel children fibers
+            oldFiber.target = this.target || oldFiber.target;
+            oldFiber.position = this.position || oldFiber.position;
             oldFiber.isCompleted = false; // keep the root fiber alive
             oldFiber.isRendered = false; // the fiber has to be re-rendered
             if (oldFiber.child) {
@@ -3509,7 +3518,8 @@
         complete() {
             let component = this.component;
             this.isCompleted = true;
-            if (!this.target && !component.__owl__.isMounted) {
+            const status = component.__owl__.status;
+            if (status === 5 /* DESTROYED */) {
                 return;
             }
             // build patchQueue
@@ -3521,14 +3531,16 @@
             this._walk(doWork);
             const patchLen = patchQueue.length;
             // call willPatch hook on each fiber of patchQueue
-            for (let i = 0; i < patchLen; i++) {
-                const fiber = patchQueue[i];
-                if (fiber.shouldPatch) {
-                    component = fiber.component;
-                    if (component.__owl__.willPatchCB) {
-                        component.__owl__.willPatchCB();
+            if (status === 3 /* MOUNTED */) {
+                for (let i = 0; i < patchLen; i++) {
+                    const fiber = patchQueue[i];
+                    if (fiber.shouldPatch) {
+                        component = fiber.component;
+                        if (component.__owl__.willPatchCB) {
+                            component.__owl__.willPatchCB();
+                        }
+                        component.willPatch();
                     }
-                    component.willPatch();
                 }
             }
             // call __patch on each fiber of (reversed) patchQueue
@@ -3569,8 +3581,9 @@
                         component.__owl__.pvnode.elm = component.__owl__.vnode.elm;
                     }
                 }
-                if (fiber === component.__owl__.currentFiber) {
-                    component.__owl__.currentFiber = null;
+                const compOwl = component.__owl__;
+                if (fiber === compOwl.currentFiber) {
+                    compOwl.currentFiber = null;
                 }
             }
             // insert into the DOM (mount case)
@@ -3588,17 +3601,26 @@
                 this.component.env.qweb.trigger("dom-appended");
             }
             // call patched/mounted hook on each fiber of (reversed) patchQueue
-            for (let i = patchLen - 1; i >= 0; i--) {
-                const fiber = patchQueue[i];
-                component = fiber.component;
-                if (fiber.shouldPatch && !this.target) {
-                    component.patched();
-                    if (component.__owl__.patchedCB) {
-                        component.__owl__.patchedCB();
+            if (status === 3 /* MOUNTED */ || inDOM) {
+                for (let i = patchLen - 1; i >= 0; i--) {
+                    const fiber = patchQueue[i];
+                    component = fiber.component;
+                    if (fiber.shouldPatch && !this.target) {
+                        component.patched();
+                        if (component.__owl__.patchedCB) {
+                            component.__owl__.patchedCB();
+                        }
+                    }
+                    else {
+                        component.__callMounted();
                     }
                 }
-                else if (this.target ? inDOM : true) {
-                    component.__callMounted();
+            }
+            else {
+                for (let i = patchLen - 1; i >= 0; i--) {
+                    const fiber = patchQueue[i];
+                    component = fiber.component;
+                    component.__owl__.status = 4 /* UNMOUNTED */;
                 }
             }
         }
@@ -3830,6 +3852,15 @@
         document.head.appendChild(sheet);
     }
 
+    var STATUS;
+    (function (STATUS) {
+        STATUS[STATUS["CREATED"] = 0] = "CREATED";
+        STATUS[STATUS["WILLSTARTED"] = 1] = "WILLSTARTED";
+        STATUS[STATUS["RENDERED"] = 2] = "RENDERED";
+        STATUS[STATUS["MOUNTED"] = 3] = "MOUNTED";
+        STATUS[STATUS["UNMOUNTED"] = 4] = "UNMOUNTED";
+        STATUS[STATUS["DESTROYED"] = 5] = "DESTROYED";
+    })(STATUS || (STATUS = {}));
     const portalSymbol = Symbol("portal"); // FIXME
     //------------------------------------------------------------------------------
     // Component
@@ -3872,20 +3903,23 @@
                 if (!this.env.qweb) {
                     this.env.qweb = new QWeb();
                 }
+                // TODO: remove this in owl 2.0
                 if (!this.env.browser) {
                     this.env.browser = browser;
                 }
                 this.env.qweb.on("update", this, () => {
-                    if (this.__owl__.isMounted) {
-                        this.render(true);
-                    }
-                    if (this.__owl__.isDestroyed) {
-                        // this is unlikely to happen, but if a root widget is destroyed,
-                        // we want to remove our subscription.  The usual way to do that
-                        // would be to perform some check in the destroy method, but since
-                        // it is very performance sensitive, and since this is a rare event,
-                        // we simply do it lazily
-                        this.env.qweb.off("update", this);
+                    switch (this.__owl__.status) {
+                        case 3 /* MOUNTED */:
+                            this.render(true);
+                            break;
+                        case 5 /* DESTROYED */:
+                            // this is unlikely to happen, but if a root widget is destroyed,
+                            // we want to remove our subscription.  The usual way to do that
+                            // would be to perform some check in the destroy method, but since
+                            // it is very performance sensitive, and since this is a rare event,
+                            // we simply do it lazily
+                            this.env.qweb.off("update", this);
+                            break;
                     }
                 });
                 depth = 0;
@@ -3897,8 +3931,7 @@
                 depth: depth,
                 vnode: null,
                 pvnode: null,
-                isMounted: false,
-                isDestroyed: false,
+                status: 0 /* CREATED */,
                 parent: parent || null,
                 children: {},
                 cmap: {},
@@ -3920,6 +3953,7 @@
             if (constr.style) {
                 this.__applyStyles(constr);
             }
+            this.setup();
         }
         /**
          * The `el` is the root element of the component.  Note that it could be null:
@@ -3928,6 +3962,16 @@
         get el() {
             return this.__owl__.vnode ? this.__owl__.vnode.elm : null;
         }
+        /**
+         * setup is run just after the component is constructed. This is the standard
+         * location where the component can setup its hooks. It has some advantages
+         * over the constructor:
+         *  - it can be patched (useful in odoo ecosystem)
+         *  - it does not need to propagate the arguments to the super call
+         *
+         * Note: this method should not be called manually.
+         */
+        setup() { }
         /**
          * willStart is an asynchronous hook that can be implemented to perform some
          * action before the initial rendering of a component.
@@ -4006,52 +4050,53 @@
          * Note that a component can be mounted an unmounted several times
          */
         async mount(target, options = {}) {
-            const position = options.position || "last-child";
-            const __owl__ = this.__owl__;
-            if (__owl__.isMounted) {
-                if (position !== "self" && this.el.parentNode !== target) {
-                    // in this situation, we are trying to mount a component on a different
-                    // target. In this case, we need to unmount first, otherwise it will
-                    // not work.
-                    this.unmount();
-                }
-                else {
-                    return Promise.resolve();
-                }
-            }
-            if (__owl__.isDestroyed) {
-                throw new Error("Cannot mount a destroyed component");
-            }
-            if (__owl__.currentFiber) {
-                const currentFiber = __owl__.currentFiber;
-                if (currentFiber.target === target && currentFiber.position === position) {
-                    return scheduler.addFiber(currentFiber);
-                }
-                else {
-                    scheduler.rejectFiber(currentFiber, "Mounting operation cancelled");
-                }
-            }
             if (!(target instanceof HTMLElement || target instanceof DocumentFragment)) {
                 let message = `Component '${this.constructor.name}' cannot be mounted: the target is not a valid DOM node.`;
                 message += `\nMaybe the DOM is not ready yet? (in that case, you can use owl.utils.whenReady)`;
                 throw new Error(message);
             }
-            const fiber = new Fiber(null, this, false, target, position);
-            fiber.shouldPatch = false;
-            if (!__owl__.vnode) {
-                this.__prepareAndRender(fiber, () => { });
+            const position = options.position || "last-child";
+            const __owl__ = this.__owl__;
+            const currentFiber = __owl__.currentFiber;
+            switch (__owl__.status) {
+                case 0 /* CREATED */: {
+                    const fiber = new Fiber(null, this, true, target, position);
+                    fiber.shouldPatch = false;
+                    this.__prepareAndRender(fiber, () => { });
+                    return scheduler.addFiber(fiber);
+                }
+                case 1 /* WILLSTARTED */:
+                case 2 /* RENDERED */:
+                    currentFiber.target = target;
+                    currentFiber.position = position;
+                    return scheduler.addFiber(currentFiber);
+                case 4 /* UNMOUNTED */: {
+                    const fiber = new Fiber(null, this, true, target, position);
+                    fiber.shouldPatch = false;
+                    this.__render(fiber);
+                    return scheduler.addFiber(fiber);
+                }
+                case 3 /* MOUNTED */: {
+                    if (position !== "self" && this.el.parentNode !== target) {
+                        const fiber = new Fiber(null, this, true, target, position);
+                        fiber.shouldPatch = false;
+                        this.__render(fiber);
+                        return scheduler.addFiber(fiber);
+                    }
+                    else {
+                        return Promise.resolve();
+                    }
+                }
+                case 5 /* DESTROYED */:
+                    throw new Error("Cannot mount a destroyed component");
             }
-            else {
-                this.__render(fiber);
-            }
-            return scheduler.addFiber(fiber);
         }
         /**
          * The unmount method is the opposite of the mount method.  It is useful
          * to call willUnmount calls and remove the component from the DOM.
          */
         unmount() {
-            if (this.__owl__.isMounted) {
+            if (this.__owl__.status === 3 /* MOUNTED */) {
                 this.__callWillUnmount();
                 this.el.remove();
             }
@@ -4068,10 +4113,7 @@
         async render(force = false) {
             const __owl__ = this.__owl__;
             const currentFiber = __owl__.currentFiber;
-            if (!__owl__.isMounted && !currentFiber) {
-                // if we get here, this means that the component was either never mounted,
-                // or was unmounted and some state change  triggered a render. Either way,
-                // we do not want to actually render anything in this case.
+            if (!__owl__.vnode && !currentFiber) {
                 return;
             }
             if (currentFiber && !currentFiber.isRendered && !currentFiber.isCompleted) {
@@ -4080,15 +4122,13 @@
             // if we aren't mounted at this point, it implies that there is a
             // currentFiber that is already rendered (isRendered is true), so we are
             // about to be mounted
-            const isMounted = __owl__.isMounted;
+            const status = __owl__.status;
             const fiber = new Fiber(null, this, force, null, null);
             Promise.resolve().then(() => {
-                if (__owl__.isMounted || !isMounted) {
-                    if (fiber.isCompleted) {
+                if (__owl__.status === 3 /* MOUNTED */ || status !== 3 /* MOUNTED */) {
+                    if (fiber.isCompleted || fiber.isRendered) {
                         return;
                     }
-                    // we are mounted (__owl__.isMounted), or if we are currently being
-                    // mounted (!isMounted), so we call __render
                     this.__render(fiber);
                 }
                 else {
@@ -4112,7 +4152,7 @@
          */
         destroy() {
             const __owl__ = this.__owl__;
-            if (!__owl__.isDestroyed) {
+            if (__owl__.status !== 5 /* DESTROYED */) {
                 const el = this.el;
                 this.__destroy(__owl__.parent);
                 if (el) {
@@ -4153,13 +4193,12 @@
          */
         __destroy(parent) {
             const __owl__ = this.__owl__;
-            const isMounted = __owl__.isMounted;
-            if (isMounted) {
+            if (__owl__.status === 3 /* MOUNTED */) {
                 if (__owl__.willUnmountCB) {
                     __owl__.willUnmountCB();
                 }
                 this.willUnmount();
-                __owl__.isMounted = false;
+                __owl__.status = 4 /* UNMOUNTED */;
             }
             const children = __owl__.children;
             for (let key in children) {
@@ -4170,7 +4209,7 @@
                 delete parent.__owl__.children[id];
                 __owl__.parent = null;
             }
-            __owl__.isDestroyed = true;
+            __owl__.status = 5 /* DESTROYED */;
             delete __owl__.vnode;
             if (__owl__.currentFiber) {
                 __owl__.currentFiber.isCompleted = true;
@@ -4178,7 +4217,7 @@
         }
         __callMounted() {
             const __owl__ = this.__owl__;
-            __owl__.isMounted = true;
+            __owl__.status = 3 /* MOUNTED */;
             __owl__.currentFiber = null;
             this.mounted();
             if (__owl__.mountedCB) {
@@ -4191,7 +4230,7 @@
                 __owl__.willUnmountCB();
             }
             this.willUnmount();
-            __owl__.isMounted = false;
+            __owl__.status = 4 /* UNMOUNTED */;
             if (__owl__.currentFiber) {
                 __owl__.currentFiber.isCompleted = true;
                 __owl__.currentFiber.root.counter = 0;
@@ -4199,7 +4238,7 @@
             const children = __owl__.children;
             for (let id in children) {
                 const comp = children[id];
-                if (comp.__owl__.isMounted) {
+                if (comp.__owl__.status === 3 /* MOUNTED */) {
                     comp.__callWillUnmount();
                 }
             }
@@ -4319,17 +4358,23 @@
         }
         async __prepareAndRender(fiber, cb) {
             try {
-                await Promise.all([this.willStart(), this.__owl__.willStartCB && this.__owl__.willStartCB()]);
+                const proms = Promise.all([
+                    this.willStart(),
+                    this.__owl__.willStartCB && this.__owl__.willStartCB(),
+                ]);
+                this.__owl__.status = 1 /* WILLSTARTED */;
+                await proms;
+                if (this.__owl__.status === 5 /* DESTROYED */) {
+                    return Promise.resolve();
+                }
             }
             catch (e) {
                 fiber.handleError(e);
                 return Promise.resolve();
             }
-            if (this.__owl__.isDestroyed) {
-                return Promise.resolve();
-            }
             if (!fiber.isCompleted) {
                 this.__render(fiber);
+                this.__owl__.status = 2 /* RENDERED */;
                 cb();
             }
         }
@@ -4351,7 +4396,7 @@
                 for (let childKey in __owl__.children) {
                     const child = __owl__.children[childKey];
                     const childOwl = child.__owl__;
-                    if (!childOwl.isMounted && childOwl.parentLastFiberId < fiber.id) {
+                    if (childOwl.status !== 3 /* MOUNTED */ && childOwl.parentLastFiberId < fiber.id) {
                         // we only do here a "soft" destroy, meaning that we leave the child
                         // dom node alone, without removing it.  Most of the time, it does not
                         // matter, because the child component is already unmounted.  However,
@@ -4398,16 +4443,6 @@
             }
         }
         /**
-         * Only called by qweb t-component directive (when t-keepalive is set)
-         */
-        __remount() {
-            const __owl__ = this.__owl__;
-            if (!__owl__.isMounted) {
-                __owl__.isMounted = true;
-                this.mounted();
-            }
-        }
-        /**
          * Apply default props (only top level).
          *
          * Note that this method does modify in place the props
@@ -4427,6 +4462,23 @@
     Component.env = {};
     // expose scheduler s.t. it can be mocked for testing purposes
     Component.scheduler = scheduler;
+    async function mount(C, params) {
+        const { env, props, target } = params;
+        let origEnv = C.hasOwnProperty("env") ? C.env : null;
+        if (env) {
+            C.env = env;
+        }
+        const component = new C(null, props);
+        if (origEnv) {
+            C.env = origEnv;
+        }
+        else {
+            delete C.env;
+        }
+        const position = params.position || "last-child";
+        await component.mount(target, { position });
+        return component;
+    }
 
     /**
      * The `Context` object provides a way to share data between an arbitrary number
@@ -4533,16 +4585,6 @@
             __owl__.observer = new Observer();
             __owl__.observer.notifyCB = component.render.bind(component);
         }
-        const currentCB = __owl__.observer.notifyCB;
-        __owl__.observer.notifyCB = function () {
-            if (ctx.rev > mapping[id]) {
-                // in this case, the context has been updated since we were rendering
-                // last, and we do not need to render here with the observer. A
-                // rendering is coming anyway, with the correct props.
-                return;
-            }
-            currentCB();
-        };
         mapping[id] = 0;
         const renderFn = __owl__.renderFn;
         __owl__.renderFn = function (comp, params) {
@@ -4666,6 +4708,23 @@
         };
     }
     // -----------------------------------------------------------------------------
+    // "Builder" hooks
+    // -----------------------------------------------------------------------------
+    /**
+     * This hook is useful as a building block for some customized hooks, that may
+     * need a reference to the component calling them.
+     */
+    function useComponent() {
+        return Component.current;
+    }
+    /**
+     * This hook is useful as a building block for some customized hooks, that may
+     * need a reference to the env of the component calling them.
+     */
+    function useEnv() {
+        return Component.current.env;
+    }
+    // -----------------------------------------------------------------------------
     // useSubEnv
     // -----------------------------------------------------------------------------
     /**
@@ -4709,6 +4768,8 @@
         onWillStart: onWillStart,
         onWillUpdateProps: onWillUpdateProps,
         useRef: useRef,
+        useComponent: useComponent,
+        useEnv: useEnv,
         useSubEnv: useSubEnv,
         useExternalListener: useExternalListener
     });
@@ -4742,6 +4803,10 @@
             }, ...payload);
             return result;
         }
+        __notifyComponents() {
+            this.trigger("before-update");
+            return super.__notifyComponents();
+        }
     }
     const isStrictEqual = (a, b) => a === b;
     function useStore(selector, options = {}) {
@@ -4764,12 +4829,15 @@
             const newRevNumber = hashFn(result);
             if ((newRevNumber > 0 && revNumber !== newRevNumber) || !isEqual(oldResult, result)) {
                 revNumber = newRevNumber;
-                if (options.onUpdate) {
-                    options.onUpdate(result);
-                }
                 return true;
             }
             return false;
+        }
+        if (options.onUpdate) {
+            store.on("before-update", component, () => {
+                const newValue = selector(store.state, component.props);
+                options.onUpdate(newValue);
+            });
         }
         store.updateFunctions[componentId].push(function () {
             return selectCompareUpdate(store.state, component.props);
@@ -4789,6 +4857,9 @@
         const __destroy = component.__destroy;
         component.__destroy = (parent) => {
             delete store.updateFunctions[componentId];
+            if (options.onUpdate) {
+                store.off("before-update", component);
+            }
             __destroy.call(component, parent);
         };
         if (typeof result !== "object" || result === null) {
@@ -5076,6 +5147,7 @@
   `;
 
     const paramRegexp = /\{\{(.*?)\}\}/;
+    const globalParamRegexp = new RegExp(paramRegexp.source, "g");
     class Router {
         constructor(env, routes, options = { mode: "history" }) {
             this.currentRoute = null;
@@ -5097,6 +5169,7 @@
                     this.validateDestination(partialRoute.redirect);
                 }
                 partialRoute.params = partialRoute.path ? findParams(partialRoute.path) : [];
+                partialRoute.extractionRegExp = makeExtractionRegExp(partialRoute.path);
                 this.routes[partialRoute.name] = partialRoute;
                 this.routeIds.push(partialRoute.name);
             }
@@ -5171,19 +5244,12 @@
             }
         }
         routeToPath(route, params) {
-            const path = route.path;
-            const parts = path.split("/");
-            const l = parts.length;
-            for (let i = 0; i < l; i++) {
-                const part = parts[i];
-                const match = part.match(paramRegexp);
-                if (match) {
-                    const key = match[1].split(".")[0];
-                    parts[i] = params[key];
-                }
-            }
             const prefix = this.mode === "hash" ? "#" : "";
-            return prefix + parts.join("/");
+            return (prefix +
+                route.path.replace(globalParamRegexp, (match, param) => {
+                    const [key] = param.split(".");
+                    return params[key];
+                }));
         }
         currentPath() {
             let result = this.mode === "history" ? window.location.pathname : window.location.hash.slice(1);
@@ -5240,42 +5306,46 @@
             if (path.startsWith("#")) {
                 path = path.slice(1);
             }
-            const descrParts = route.path.split("/");
-            const targetParts = path.split("/");
-            const l = descrParts.length;
-            if (l !== targetParts.length) {
+            const paramsMatch = path.match(route.extractionRegExp);
+            if (!paramsMatch) {
                 return false;
             }
             const result = {};
-            for (let i = 0; i < l; i++) {
-                const descr = descrParts[i];
-                let target = targetParts[i];
-                const match = descr.match(paramRegexp);
-                if (match) {
-                    const [key, suffix] = match[1].split(".");
-                    if (suffix === "number") {
-                        target = parseInt(target, 10);
-                    }
-                    result[key] = target;
+            route.params.forEach((param, index) => {
+                const [key, suffix] = param.split(".");
+                const paramValue = paramsMatch[index + 1];
+                if (suffix === "number") {
+                    return (result[key] = parseInt(paramValue, 10));
                 }
-                else if (descr !== target) {
-                    return false;
-                }
-            }
+                return (result[key] = paramValue);
+            });
             return result;
         }
     }
     function findParams(str) {
-        const globalParamRegexp = /\{\{(.*?)\}\}/g;
         const result = [];
         let m;
         do {
             m = globalParamRegexp.exec(str);
             if (m) {
-                result.push(m[1].split(".")[0]);
+                result.push(m[1]);
             }
         } while (m);
         return result;
+    }
+    function escapeRegExp(str) {
+        return str.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&");
+    }
+    function makeExtractionRegExp(path) {
+        // replace param strings with capture groups so that we can build a regex to match over the path
+        const extractionString = path
+            .split(paramRegexp)
+            .map((part, index) => {
+            return index % 2 ? "(.*)" : escapeRegExp(part);
+        })
+            .join("");
+        // Example: /home/{{param1}}/{{param2}} => ^\/home\/(.*)\/(.*)$
+        return new RegExp(`^${extractionString}$`);
     }
 
     /**
@@ -5305,19 +5375,21 @@
     exports.QWeb = QWeb;
     exports.Store = Store$1;
     exports.__info__ = __info__;
+    exports.browser = browser;
     exports.config = config;
     exports.core = core;
     exports.hooks = hooks$1;
     exports.misc = misc;
+    exports.mount = mount;
     exports.router = router;
     exports.tags = tags;
     exports.useState = useState$1;
     exports.utils = utils;
 
 
-    __info__.version = '1.0.13';
-    __info__.date = '2020-10-26T07:38:42.693Z';
-    __info__.hash = 'd615ffd';
+    __info__.version = '1.2.6';
+    __info__.date = '2021-05-19T10:28:32.429Z';
+    __info__.hash = 'e838781';
     __info__.url = 'https://github.com/odoo/owl';
 
 
